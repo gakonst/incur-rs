@@ -126,10 +126,26 @@ and the `completions`, `skills`, and `mcp` integrations.
 
 ## Structured errors and CTAs
 
+A CTA (call to action) is an optional, machine-readable follow-up command. It lets a handler say
+“the item was created; inspect it with `get 42`” or “authentication failed; run `auth login`”
+without asking an agent to extract a shell command from prose. CTAs are recommendations: Incur
+returns them but never executes them automatically.
+
+| CTA field | Meaning |
+| --- | --- |
+| `command` | Subcommand path relative to the same executable, such as `project get` |
+| `args` | Positional JSON values, preserved in order |
+| `options` | Named JSON values rendered as `--option value`; `true` becomes a bare flag |
+| `description` | Why this particular command is useful |
+| `CtaBlock::description` | A heading shared by a group of alternatives |
+
+Use `Context::suggest` to attach next steps to a successful result. Attach a block to
+`incur::Error` when the suggestions explain how to recover from a failure:
+
 ```rust
 use incur::{Cta, CtaBlock, Error};
 
-// From a handler:
+// Success: return the new item and suggest useful follow-ups.
 context.suggest(
     CtaBlock::new([
         Cta::new("get").arg(42).description("View the new item"),
@@ -138,14 +154,35 @@ context.suggest(
     .description("Suggested commands:"),
 );
 
+// Failure: preserve a stable code and tell the caller how to recover.
 return Err(Error::new("AUTH_REQUIRED", "log in before deploying")
     .retryable(false)
     .cta(CtaBlock::new([Cta::new("auth login")]))
     .into());
 ```
 
-CTAs are rendered as commands for humans and remain structured under `meta.cta` in CLI, MCP, and
-HTTP envelopes.
+On a human terminal, Incur turns the same structure into copy-pasteable commands:
+
+```console
+$ items create deploy
+id: 42
+name: deploy
+
+Next:
+  items get 42  # Inspect the created item
+
+$ items get 7
+NOT_FOUND: item 7 does not exist
+
+Next steps:
+  items create example
+```
+
+Machine consumers keep the fields separate. Successful CLI and HTTP envelopes place the block at
+`meta.cta`; error envelopes place recovery commands at `error.cta`. A successful MCP tool call
+copies it to `result._meta.cta` alongside the tool's `structuredContent`. This lets an agent inspect
+the suggestion, validate it against the reflected command schema, ask for confirmation when
+needed, and invoke it through the same CLI, HTTP, or MCP surface.
 
 ## Middleware and variables
 

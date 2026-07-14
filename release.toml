@@ -1,0 +1,7 @@
+# Configuration for cargo-release.
+allow-branch = ["main"]
+sign-commit = true
+sign-tag = true
+shared-version = true
+pre-release-commit-message = "chore: release {{version}}"
+tag-prefix = ""

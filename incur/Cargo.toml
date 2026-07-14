@@ -1,0 +1,48 @@
+[package]
+name = "incur"
+description = "A typed CLI framework for agents and humans"
+keywords = ["ai", "agent", "cli", "mcp", "schema"]
+categories = ["command-line-interface", "development-tools"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+readme = "../README.md"
+exclude = ["tests/fixtures"]
+
+[features]
+default = ["http", "mcp", "skills", "toon"]
+http = ["dep:form_urlencoded", "dep:http", "dep:percent-encoding"]
+mcp = ["dep:toml_edit"]
+skills = ["dep:sha2"]
+toon = ["dep:toon-format"]
+
+[dependencies]
+clap.workspace = true
+clap_derive.workspace = true
+clap_complete.workspace = true
+eyre.workspace = true
+form_urlencoded = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+is-terminal.workspace = true
+incur-macros = { path = "../incur-macros", version = "0.1.0" }
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2 = { workspace = true, optional = true }
+thiserror.workspace = true
+tiktoken-rs.workspace = true
+tokio.workspace = true
+toml_edit = { workspace = true, optional = true }
+toon-format = { workspace = true, optional = true }
+percent-encoding = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

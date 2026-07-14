@@ -1,0 +1,46 @@
+[package]
+name = "incur-examples"
+description = "Progressive examples for incur"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = ["http", "mcp", "skills", "toon"]
+http = ["incur/http"]
+mcp = ["incur/mcp"]
+skills = ["incur/skills"]
+toon = ["incur/toon"]
+
+[dependencies]
+incur = { path = "../incur", version = "0.1.0", default-features = false }
+
+[[bin]]
+name = "01_greet"
+path = "01_greet.rs"
+
+[[bin]]
+name = "02_subcommands"
+path = "02_subcommands.rs"
+
+[[bin]]
+name = "03_ctas_and_errors"
+path = "03_ctas_and_errors.rs"
+
+[[bin]]
+name = "04_middleware_and_config"
+path = "04_middleware_and_config.rs"
+
+[[bin]]
+name = "05_http_and_mcp"
+path = "05_http_and_mcp.rs"
+required-features = ["http", "mcp"]
+
+[[bin]]
+name = "06_tool_metadata"
+path = "06_tool_metadata.rs"
+
+[lints]
+workspace = true

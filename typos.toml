@@ -1,0 +1,7 @@
+[files]
+extend-exclude = ["Cargo.lock", "target", "*.json", "**/tests/**"]
+
+[default.extend-words]
+ndjson = "ndjson"
+schemars = "schemars"
+toon = "toon"

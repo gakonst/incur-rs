@@ -269,9 +269,43 @@ same routes, also served at `/openapi.json`, `/openapi.yml`, `/openapi.yaml`, an
 
 ## Progressive examples
 
-The [examples learning path](examples/README.md) starts with a one-command greeting
-and builds through subcommands, structured errors and CTAs, middleware and config, HTTP/MCP, and
-per-tool safety metadata. Every example is compiled by CI.
+The [`examples/`](examples) learning path starts with one command and adds one layer at a time.
+Every example is runnable and compiled by CI.
+
+| Example | What it adds | Try it |
+| --- | --- | --- |
+| [`01_greet.rs`](examples/01_greet.rs) | Derive an input and typed output | `cargo run -p incur-examples --bin 01_greet -- Ada` |
+| [`02_subcommands.rs`](examples/02_subcommands.rs) | Subcommands, value enums, defaults, and output enums | `cargo run -p incur-examples --bin 02_subcommands -- install tracing --kind development` |
+| [`03_ctas_and_errors.rs`](examples/03_ctas_and_errors.rs) | Stable errors and structured suggestions | `cargo run -p incur-examples --bin 03_ctas_and_errors -- create deploy --format json` |
+| [`04_middleware_and_config.rs`](examples/04_middleware_and_config.rs) | Middleware, shared context, config defaults, and output policy | `cargo run -p incur-examples --bin 04_middleware_and_config -- run api --json` |
+| [`05_http_and_mcp.rs`](examples/05_http_and_mcp.rs) | HTTP routing and MCP from the same command graph | `cargo run -p incur-examples --bin 05_http_and_mcp` |
+| [`06_tool_metadata.rs`](examples/06_tool_metadata.rs) | Nested tools, agent instructions, and safety annotations | `cargo run -p incur-examples --bin 06_tool_metadata -- --llms-full` |
+
+Suggestions are structured data rather than prose that an agent must parse. Running example 3's
+`create` command returns the next valid command under `meta.cta`:
+
+```json
+{
+  "ok": true,
+  "data": { "id": 42, "name": "deploy" },
+  "meta": {
+    "command": "create",
+    "duration": "…",
+    "cta": {
+      "commands": [
+        {
+          "command": "get",
+          "args": [42],
+          "description": "Inspect the created item"
+        }
+      ],
+      "description": "Next:"
+    }
+  }
+}
+```
+
+See the [examples guide](examples/README.md) for the complete sequence and inspection commands.
 
 ## Cargo features
 

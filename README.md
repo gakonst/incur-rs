@@ -77,14 +77,13 @@ message: hello Ada
 
 $ greet Ada --format json
 {
-  "ok": true,
-  "data": { "message": "hello Ada" },
-  "meta": { "command": "", "duration": "23µs" }
+  "message": "hello Ada"
 }
 ```
 
 `Context::agent` is `true` when stdout is not a terminal. Agent/pipe output includes the complete
-envelope; human TTY output shows data only unless `--full-output` or a format is explicitly chosen.
+envelope; human TTY output shows data only unless `--full-output` is chosen. An explicit format also
+opts an `agent-only` command back into visible human output.
 
 ## Subcommands
 
@@ -145,7 +144,8 @@ return Err(Error::new("AUTH_REQUIRED", "log in before deploying")
     .into());
 ```
 
-CTAs are rendered as commands for humans and remain structured in CLI/MCP/HTTP envelopes.
+CTAs are rendered as commands for humans and remain structured under `meta.cta` in CLI, MCP, and
+HTTP envelopes.
 
 ## Middleware and variables
 
@@ -277,12 +277,17 @@ per-tool safety metadata. Every example is compiled by CI.
 
 | Cargo feature | Default | Capability |
 | --- | --- | --- |
+| `completions` | yes | static shell completion generation |
+| `tokens` | yes | exact `cl100k_base` counting and pagination |
+| `yaml` | yes | YAML output and OpenAPI YAML discovery routes |
 | `toon` | yes | TOON encoding; JSON fallback when disabled |
 | `skills` | yes | skill generation and installation |
 | `mcp` | yes | stdio/HTTP MCP and agent registration |
 | `http` | yes | dependency-light HTTP command serving |
 
-Feature combinations are checked independently in CI.
+Feature combinations are checked independently in CI. `default-features = false` keeps the core
+derive, parser, schema, JSON, Markdown, JSONL, middleware, and config runtime while omitting every
+optional transport and formatter integration.
 
 ## Development
 

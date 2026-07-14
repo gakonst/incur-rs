@@ -8,11 +8,14 @@ license.workspace = true
 publish = false
 
 [features]
-default = ["http", "mcp", "skills", "toon"]
+default = ["completions", "http", "mcp", "skills", "tokens", "toon", "yaml"]
+completions = ["incur/completions"]
 http = ["incur/http"]
 mcp = ["incur/mcp"]
 skills = ["incur/skills"]
+tokens = ["incur/tokens"]
 toon = ["incur/toon"]
+yaml = ["incur/yaml"]
 
 [dependencies]
 incur = { path = "../incur", version = "0.1.0", default-features = false }

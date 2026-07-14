@@ -37,6 +37,20 @@ struct Output {
     count: usize,
 }
 
+#[derive(Debug, Parser)]
+#[command(name = "collisions")]
+struct CollisionCli {
+    #[command(subcommand)]
+    command: CollisionCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CollisionCommand {
+    Completions { shell: String },
+    Skills { action: String },
+    Mcp { action: String },
+}
+
 #[cfg(feature = "http")]
 #[derive(Debug, Parser)]
 #[command(name = "transport")]
@@ -72,6 +86,30 @@ fn app() -> incur::App<Cli> {
     })
 }
 
+fn app_with_cta() -> incur::App<Cli> {
+    Cli::incur(|cli, context| async move {
+        context.suggest(incur::CtaBlock::new([incur::Cta::new("greet").arg("Grace")]));
+        match cli.command {
+            Command::Greet { name, count, loud } => {
+                let message = format!("hello {name}");
+                Ok(Output { message: if loud { message.to_uppercase() } else { message }, count })
+            }
+            Command::Fail => Err(Error::new("NOPE", "requested failure").into()),
+        }
+    })
+}
+
+fn collision_app() -> incur::App<CollisionCli> {
+    CollisionCli::incur(|cli, _context| async move {
+        let (command, value) = match cli.command {
+            CollisionCommand::Completions { shell } => ("completions", shell),
+            CollisionCommand::Skills { action } => ("skills", action),
+            CollisionCommand::Mcp { action } => ("mcp", action),
+        };
+        Ok(json!({"command": command, "value": value}))
+    })
+}
+
 #[cfg(feature = "http")]
 fn transport_app() -> incur::App<TransportCli> {
     TransportCli::incur(|cli, _context| async move {
@@ -82,6 +120,14 @@ fn transport_app() -> incur::App<TransportCli> {
             dry_run: cli.dry_run,
         })
     })
+}
+
+#[cfg(all(feature = "http", feature = "mcp"))]
+fn mcp_request(body: Vec<u8>) -> incur::HttpRequest {
+    let mut request = incur::HttpRequest::new(body);
+    *request.method_mut() = "POST".parse().unwrap();
+    *request.uri_mut() = "/mcp".parse().unwrap();
+    request
 }
 
 #[tokio::test]
@@ -142,6 +188,45 @@ async fn exposes_llm_manifest() {
 }
 
 #[tokio::test]
+async fn validates_formats_for_manifest_shortcuts() {
+    let result = app().execute_from(["fixture", "--llms", "--format", "invalid"]).await;
+    assert_eq!(result.exit_code, 2);
+    assert!(result.stderr.contains("unsupported output format"));
+
+    let result = app().execute_from(["fixture", "--schema", "--format"]).await;
+    assert_eq!(result.exit_code, 2);
+    assert!(result.stderr.contains("--format"));
+}
+
+#[cfg(feature = "completions")]
+#[tokio::test]
+async fn builtin_completion_help_has_no_side_effect() {
+    let result = app().execute_from(["fixture", "completions", "--help"]).await;
+    assert_eq!(result.exit_code, 0);
+    assert!(result.stdout.contains("Usage:"));
+}
+
+#[cfg(feature = "skills")]
+#[tokio::test]
+async fn builtin_skills_help_and_values_are_parsed_before_side_effects() {
+    let result = app().execute_from(["fixture", "skills", "add", "--help"]).await;
+    assert_eq!(result.exit_code, 0);
+    assert!(result.stdout.contains("Usage:"));
+
+    let result = app().execute_from(["fixture", "skills", "add", "--depth", "invalid"]).await;
+    assert_eq!(result.exit_code, 2);
+    assert!(result.stderr.contains("invalid value"));
+}
+
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn builtin_mcp_help_has_no_side_effect() {
+    let result = app().execute_from(["fixture", "mcp", "add", "--help"]).await;
+    assert_eq!(result.exit_code, 0);
+    assert!(result.stdout.contains("Usage:"));
+}
+
+#[tokio::test]
 async fn reports_structured_errors_to_agents() {
     let result = app().execute_from(["fixture", "fail", "--format", "json"]).await;
     assert_eq!(result.exit_code, 1);
@@ -169,6 +254,73 @@ async fn middleware_wraps_the_handler() {
     let result = app.execute_from(["fixture", "greet", "Ada"]).await;
     assert_eq!(result.exit_code, 0);
     assert_eq!(*events.lock().unwrap(), ["before", "after"]);
+}
+
+#[tokio::test]
+async fn middleware_reentry_returns_an_error_instead_of_panicking() {
+    let app = app().middleware(|context: Context, next: incur::Next| async move {
+        let second = next.clone();
+        next.run(context.clone()).await?;
+        second.run(context).await
+    });
+    let result = app.execute_from(["fixture", "greet", "Ada", "--format", "json"]).await;
+    assert_eq!(result.exit_code, 1);
+    let value: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "MIDDLEWARE_REENTRY");
+}
+
+#[tokio::test]
+async fn puts_ctas_in_envelope_metadata() {
+    let result = app_with_cta().execute_from(["fixture", "greet", "Ada", "--format", "json"]).await;
+    let value: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+    assert_eq!(value["meta"]["cta"]["commands"][0]["command"], "greet");
+    assert!(value.get("cta").is_none());
+}
+
+#[cfg(feature = "tokens")]
+#[tokio::test]
+async fn token_pagination_preserves_a_valid_envelope() {
+    let result = app()
+        .execute_from(["fixture", "greet", "Ada", "--format", "json", "--token-limit", "3"])
+        .await;
+    assert_eq!(result.exit_code, 0, "{}", result.stderr);
+    let value: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+    assert_eq!(value["ok"], true);
+    assert!(value["data"].as_str().unwrap().contains("[truncated:"));
+    assert!(value["meta"]["nextOffset"].is_number());
+
+    let result = app().execute_from(["fixture", "greet", "Ada", "--token-limit", "0"]).await;
+    assert_eq!(result.exit_code, 2);
+}
+
+#[tokio::test]
+async fn disabled_features_do_not_advertise_dead_commands() {
+    let result = app().execute_from(["fixture", "--help"]).await;
+    assert_eq!(result.exit_code, 0);
+    #[cfg(not(feature = "completions"))]
+    assert!(!result.stdout.contains("completions"));
+    #[cfg(not(feature = "skills"))]
+    assert!(!result.stdout.contains("skills"));
+    #[cfg(not(feature = "mcp"))]
+    {
+        assert!(!result.stdout.contains("mcp"));
+        assert!(!result.stdout.contains("--mcp"));
+    }
+    #[cfg(not(feature = "tokens"))]
+    assert!(!result.stdout.contains("--token-"));
+    #[cfg(not(feature = "yaml"))]
+    assert!(!result.stdout.contains("yaml"));
+}
+
+#[tokio::test]
+async fn user_commands_win_over_builtin_names() {
+    for (command, value) in [("completions", "zsh"), ("skills", "add"), ("mcp", "add")] {
+        let result =
+            collision_app().execute_from(["collisions", command, value, "--format", "json"]).await;
+        assert_eq!(result.exit_code, 0, "{}: {}", command, result.stderr);
+        let output: serde_json::Value = serde_json::from_str(&result.stdout).unwrap();
+        assert_eq!(output["data"], json!({"command": command, "value": value}));
+    }
 }
 
 #[cfg(feature = "http")]
@@ -268,18 +420,17 @@ async fn serves_mcp_over_http() {
             },
         )
         .mcp_instructions("Use fixture tools in tests.");
-    let mut request = incur::HttpRequest::new(
+    let request = mcp_request(
         serde_json::to_vec(&json!({"jsonrpc":"2.0","id":0,"method":"initialize"})).unwrap(),
     );
-    *request.uri_mut() = "/mcp".parse().unwrap();
     let response = app.handle_http(request).await;
     let value: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+    assert_eq!(value["result"]["protocolVersion"], "2025-11-25");
     assert_eq!(value["result"]["instructions"], "Use fixture tools in tests.");
 
-    let mut request = incur::HttpRequest::new(
+    let request = mcp_request(
         serde_json::to_vec(&json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).unwrap(),
     );
-    *request.uri_mut() = "/mcp".parse().unwrap();
     let response = app.handle_http(request).await;
     let value: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
     assert!(
@@ -294,7 +445,7 @@ async fn serves_mcp_over_http() {
     assert_eq!(greet["annotations"]["readOnlyHint"], true);
     assert_eq!(greet["_meta"]["instructions"], "Use the person's preferred name.");
 
-    let mut request = incur::HttpRequest::new(
+    let request = mcp_request(
         serde_json::to_vec(&json!({
             "jsonrpc":"2.0",
             "id":2,
@@ -303,12 +454,11 @@ async fn serves_mcp_over_http() {
         }))
         .unwrap(),
     );
-    *request.uri_mut() = "/mcp".parse().unwrap();
     let response = app.handle_http(request).await;
     let value: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
     assert_eq!(value["result"]["structuredContent"]["message"], "hello Ada");
 
-    let mut request = incur::HttpRequest::new(
+    let request = mcp_request(
         serde_json::to_vec(&json!({
             "jsonrpc":"2.0",
             "id":3,
@@ -317,9 +467,61 @@ async fn serves_mcp_over_http() {
         }))
         .unwrap(),
     );
-    *request.uri_mut() = "/mcp".parse().unwrap();
     let response = app.handle_http(request).await;
     let value: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
     assert_eq!(value["result"]["isError"], true);
-    assert_eq!(value["result"]["structuredContent"]["error"]["code"], "NOPE");
+    assert_eq!(value["result"]["content"][0]["text"], "requested failure");
+}
+
+#[cfg(all(feature = "http", feature = "mcp"))]
+#[tokio::test]
+async fn validates_mcp_http_and_jsonrpc_protocol_edges() {
+    let mut get = incur::HttpRequest::new(Vec::new());
+    *get.uri_mut() = "/mcp".parse().unwrap();
+    let response = app().handle_http(get).await;
+    assert_eq!(response.status(), 405);
+    assert_eq!(response.headers()["allow"], "POST");
+
+    let invalid =
+        mcp_request(serde_json::to_vec(&json!({"jsonrpc":"1.0","id":1,"method":"ping"})).unwrap());
+    let response = app().handle_http(invalid).await;
+    let value: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+    assert_eq!(value["error"]["code"], -32600);
+
+    let notification = mcp_request(
+        serde_json::to_vec(&json!({
+            "jsonrpc":"2.0",
+            "method":"notifications/initialized"
+        }))
+        .unwrap(),
+    );
+    let response = app().handle_http(notification).await;
+    assert_eq!(response.status(), 202);
+    assert!(response.body().is_empty());
+
+    let unknown_tool = mcp_request(
+        serde_json::to_vec(&json!({
+            "jsonrpc":"2.0",
+            "id":2,
+            "method":"tools/call",
+            "params":{"name":"does_not_exist","arguments":{}}
+        }))
+        .unwrap(),
+    );
+    let response = app().handle_http(unknown_tool).await;
+    let value: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+    assert_eq!(value["error"]["code"], -32602);
+
+    let call_with_cta = mcp_request(
+        serde_json::to_vec(&json!({
+            "jsonrpc":"2.0",
+            "id":3,
+            "method":"tools/call",
+            "params":{"name":"greet","arguments":{"name":"Ada"}}
+        }))
+        .unwrap(),
+    );
+    let response = app_with_cta().handle_http(call_with_cta).await;
+    let value: serde_json::Value = serde_json::from_slice(response.body()).unwrap();
+    assert_eq!(value["result"]["_meta"]["cta"]["commands"][0]["command"], "greet");
 }

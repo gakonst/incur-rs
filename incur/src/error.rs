@@ -99,6 +99,7 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+#[cfg(feature = "yaml")]
 impl From<serde_yaml::Error> for Error {
     fn from(error: serde_yaml::Error) -> Self {
         Self::new("YAML_ERROR", error.to_string())

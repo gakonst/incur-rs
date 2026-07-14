@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::{App, Error, InternalResult as Result};
 
-const PROTOCOL_VERSION: &str = "2025-06-18";
+const PROTOCOL_VERSION: &str = "2025-11-25";
 
 pub(crate) async fn serve_stdio<T>(app: App<T>) -> Result<()>
 where
@@ -20,7 +20,17 @@ where
         if line.trim().is_empty() {
             continue;
         }
-        let request: Value = serde_json::from_str(&line)?;
+        let request: Value = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                let response =
+                    jsonrpc_error(Value::Null, -32700, format!("invalid JSON: {error}"), None);
+                output.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+                output.write_all(b"\n").await?;
+                output.flush().await?;
+                continue;
+            }
+        };
         if let Some(response) = handle_jsonrpc(&app, request).await {
             output.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
             output.write_all(b"\n").await?;
@@ -34,11 +44,27 @@ pub(crate) async fn handle_jsonrpc<T>(app: &App<T>, request: Value) -> Option<Va
 where
     T: clap::Parser + Send + 'static,
 {
-    let object = request.as_object()?;
-    let id = object.get("id").cloned();
-    let method = object.get("method")?.as_str()?;
-    id.as_ref()?;
-    let id = id.unwrap_or(Value::Null);
+    let Some(object) = request.as_object() else {
+        return Some(jsonrpc_error(
+            Value::Null,
+            -32600,
+            "JSON-RPC request must be an object",
+            None,
+        ));
+    };
+    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Some(jsonrpc_error(Value::Null, -32600, "jsonrpc must be \"2.0\"", None));
+    }
+    let Some(method) = object.get("method").and_then(Value::as_str) else {
+        return Some(jsonrpc_error(
+            Value::Null,
+            -32600,
+            "JSON-RPC request requires a string method",
+            None,
+        ));
+    };
+    let notification = !object.contains_key("id");
+    let id = object.get("id").cloned().unwrap_or(Value::Null);
     let response = match method {
         "initialize" => Ok(json!({
             "protocolVersion": PROTOCOL_VERSION,
@@ -53,6 +79,7 @@ where
             )),
         })),
         "ping" => Ok(json!({})),
+        "notifications/initialized" | "notifications/cancelled" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": list_tools(app)})),
         "tools/call" => {
             let params = object.get("params").and_then(Value::as_object);
@@ -62,35 +89,70 @@ where
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             match name {
-                Some(name) => app.call_tool(name, arguments).await.map(|envelope| {
-                    let ok = envelope.get("ok").and_then(Value::as_bool).unwrap_or(true);
-                    let data = envelope.get("data").cloned().unwrap_or_else(|| envelope.clone());
-                    let mut result = Map::from_iter([
-                        (
-                            "content".to_owned(),
-                            json!([{"type": "text", "text": serde_json::to_string(&data).unwrap_or_default()}]),
-                        ),
-                        ("isError".to_owned(), Value::Bool(!ok)),
-                    ]);
-                    if data.is_object() {
-                        result.insert("structuredContent".to_owned(), data);
-                    }
-                    Value::Object(result)
-                }),
+                Some(name) => app.call_tool(name, arguments).await.map(tool_result),
                 None => Err(Error::new("INVALID_PARAMS", "tools/call requires params.name")),
             }
         }
         _ => Err(Error::new("METHOD_NOT_FOUND", format!("unknown MCP method `{method}`"))),
     };
 
+    if notification {
+        return None;
+    }
+
     Some(match response {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        Err(error) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": { "code": rpc_code(&error.code), "message": error.message, "data": error },
-        }),
+        Err(error) => {
+            let code = rpc_code(&error.code);
+            let message = error.message.clone();
+            jsonrpc_error(id, code, message, serde_json::to_value(error).ok())
+        }
     })
+}
+
+fn tool_result(envelope: Value) -> Value {
+    let ok = envelope.get("ok").and_then(Value::as_bool).unwrap_or(true);
+    if !ok {
+        let error = envelope.get("error").cloned().unwrap_or_else(|| envelope.clone());
+        let text =
+            if error.get("fieldErrors").and_then(Value::as_array).is_some_and(|v| !v.is_empty()) {
+                serde_json::to_string(&error).unwrap_or_else(|_| "command failed".to_owned())
+            } else {
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| "command failed".to_owned())
+            };
+        return json!({
+            "content": [{"type": "text", "text": text}],
+            "isError": true,
+        });
+    }
+
+    let data = envelope.get("data").cloned().unwrap_or(Value::Null);
+    let mut result = Map::from_iter([(
+        "content".to_owned(),
+        json!([{"type": "text", "text": serde_json::to_string(&data).unwrap_or_default()}]),
+    )]);
+    if data.is_object() {
+        result.insert("structuredContent".to_owned(), data);
+    }
+    if let Some(cta) = envelope.pointer("/meta/cta").cloned() {
+        result.insert("_meta".to_owned(), json!({"cta": cta}));
+    }
+    Value::Object(result)
+}
+
+fn jsonrpc_error(id: Value, code: i32, message: impl Into<String>, data: Option<Value>) -> Value {
+    let mut error = Map::from_iter([
+        ("code".to_owned(), Value::Number(code.into())),
+        ("message".to_owned(), Value::String(message.into())),
+    ]);
+    if let Some(data) = data {
+        error.insert("data".to_owned(), data);
+    }
+    json!({"jsonrpc": "2.0", "id": id, "error": error})
 }
 
 fn list_tools<T>(app: &App<T>) -> Vec<Value> {
@@ -152,7 +214,7 @@ pub(crate) fn register(name: &str, command: &str, target: Option<&str>) -> Resul
     ];
     let mut written = Vec::new();
     for (agent, path, key) in targets {
-        if normalized_target.as_ref().is_some_and(|target| !agent.starts_with(target)) {
+        if normalized_target.as_deref().is_some_and(|target| target != agent) {
             continue;
         }
         if target.is_none() && !path.exists() && !path.parent().is_some_and(Path::exists) {
@@ -185,7 +247,7 @@ fn register_codex(path: &Path, name: &str, command: &str) -> Result<()> {
     let mut document = source
         .parse::<toml_edit::DocumentMut>()
         .map_err(|error| Error::new("CONFIG_ERROR", error.to_string()))?;
-    let tokens = split_command(command);
+    let tokens = split_command(command)?;
     let Some((executable, args)) = tokens.split_first() else {
         return Err(Error::new("CONFIG_ERROR", "MCP command cannot be empty"));
     };
@@ -212,7 +274,7 @@ fn register_json(path: &Path, key: &str, name: &str, command: &str) -> Result<()
     let servers = servers.as_object_mut().ok_or_else(|| {
         Error::new("CONFIG_ERROR", format!("{key} in {} is not an object", path.display()))
     })?;
-    let tokens = split_command(command);
+    let tokens = split_command(command)?;
     let Some((executable, args)) = tokens.split_first() else {
         return Err(Error::new("CONFIG_ERROR", "MCP command cannot be empty"));
     };
@@ -224,12 +286,21 @@ fn register_json(path: &Path, key: &str, name: &str, command: &str) -> Result<()
     Ok(())
 }
 
-fn split_command(input: &str) -> Vec<String> {
+fn split_command(input: &str) -> Result<Vec<String>> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut quote = None;
+    let mut escaped = false;
+    let mut started = false;
     for character in input.chars() {
-        if let Some(active) = quote {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            started = true;
+        } else if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            started = true;
+        } else if let Some(active) = quote {
             if character == active {
                 quote = None;
             } else {
@@ -237,22 +308,75 @@ fn split_command(input: &str) -> Vec<String> {
             }
         } else if matches!(character, '\'' | '"') {
             quote = Some(character);
+            started = true;
         } else if character.is_whitespace() {
-            if !current.is_empty() {
+            if started {
                 tokens.push(std::mem::take(&mut current));
+                started = false;
             }
         } else {
             current.push(character);
+            started = true;
         }
     }
-    if !current.is_empty() {
+    if escaped {
+        return Err(Error::new("CONFIG_ERROR", "MCP command ends with an escape character"));
+    }
+    if quote.is_some() {
+        return Err(Error::new("CONFIG_ERROR", "MCP command contains an unterminated quote"));
+    }
+    if started {
         tokens.push(current);
     }
-    tokens
+    Ok(tokens)
 }
 
 impl From<io::ErrorKind> for Error {
     fn from(kind: io::ErrorKind) -> Self {
         Self::new("IO_ERROR", kind.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{register_codex, register_json, split_command};
+
+    #[test]
+    fn splits_quoted_and_escaped_registration_commands() {
+        assert_eq!(
+            split_command(r#""/path/to my/cli" --name hello\ world """#).unwrap(),
+            ["/path/to my/cli", "--name", "hello world", ""]
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_registration_commands() {
+        assert!(split_command(r#"cli "unterminated"#).is_err());
+        assert!(split_command("cli \\").is_err());
+    }
+
+    #[test]
+    fn preserves_existing_agent_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let json_path = temp.path().join("agent.json");
+        std::fs::write(&json_path, r#"{"theme":"dark"}"#).unwrap();
+        register_json(&json_path, "mcpServers", "fixture", r#""/path/to cli" --mcp"#).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+        assert_eq!(json["theme"], "dark");
+        assert_eq!(json["mcpServers"]["fixture"]["command"], "/path/to cli");
+        assert_eq!(json["mcpServers"]["fixture"]["args"], serde_json::json!(["--mcp"]));
+
+        let toml_path = temp.path().join("config.toml");
+        std::fs::write(&toml_path, "model = \"gpt\"\n").unwrap();
+        register_codex(&toml_path, "fixture", "fixture --mcp").unwrap();
+        let toml = std::fs::read_to_string(toml_path).unwrap();
+        assert!(toml.contains("model = \"gpt\""));
+        let document = toml.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(document["mcp_servers"]["fixture"]["command"].as_str(), Some("fixture"));
+        assert_eq!(
+            document["mcp_servers"]["fixture"]["args"].as_array().unwrap().get(0).unwrap().as_str(),
+            Some("--mcp")
+        );
     }
 }

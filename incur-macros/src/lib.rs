@@ -74,42 +74,44 @@ fn expand_incur_output(input: DeriveInput) -> syn::Result<TokenStream2> {
     let (schema_impl_generics, _, schema_where_clause) = schema_generics.split_for_impl();
 
     Ok(quote! {
-        #helper
+        const _: () = {
+            #helper
 
-        #[automatically_derived]
-        impl #serialize_impl_generics #incur::serde::Serialize for #ident #type_generics
-            #serialize_where_clause
-        {
-            fn serialize<__S>(&self, serializer: __S) -> ::core::result::Result<__S::Ok, __S::Error>
-            where
-                __S: #incur::serde::Serializer,
+            #[automatically_derived]
+            impl #serialize_impl_generics #incur::serde::Serialize for #ident #type_generics
+                #serialize_where_clause
             {
-                #helper_ident::serialize(self, serializer)
-            }
-        }
-
-        #[automatically_derived]
-        impl #schema_impl_generics #incur::schemars::JsonSchema for #ident #type_generics
-            #schema_where_clause
-        {
-            fn inline_schema() -> bool {
-                <#helper_ident #type_generics as #incur::schemars::JsonSchema>::inline_schema()
+                fn serialize<__S>(&self, serializer: __S) -> ::core::result::Result<__S::Ok, __S::Error>
+                where
+                    __S: #incur::serde::Serializer,
+                {
+                    #helper_ident::serialize(self, serializer)
+                }
             }
 
-            fn schema_name() -> ::std::borrow::Cow<'static, str> {
-                <#helper_ident #type_generics as #incur::schemars::JsonSchema>::schema_name()
-            }
+            #[automatically_derived]
+            impl #schema_impl_generics #incur::schemars::JsonSchema for #ident #type_generics
+                #schema_where_clause
+            {
+                fn inline_schema() -> bool {
+                    <#helper_ident #type_generics as #incur::schemars::JsonSchema>::inline_schema()
+                }
 
-            fn schema_id() -> ::std::borrow::Cow<'static, str> {
-                <#helper_ident #type_generics as #incur::schemars::JsonSchema>::schema_id()
-            }
+                fn schema_name() -> ::std::borrow::Cow<'static, str> {
+                    <#helper_ident #type_generics as #incur::schemars::JsonSchema>::schema_name()
+                }
 
-            fn json_schema(
-                generator: &mut #incur::schemars::SchemaGenerator,
-            ) -> #incur::schemars::Schema {
-                <#helper_ident #type_generics as #incur::schemars::JsonSchema>::json_schema(generator)
+                fn schema_id() -> ::std::borrow::Cow<'static, str> {
+                    <#helper_ident #type_generics as #incur::schemars::JsonSchema>::schema_id()
+                }
+
+                fn json_schema(
+                    generator: &mut #incur::schemars::SchemaGenerator,
+                ) -> #incur::schemars::Schema {
+                    <#helper_ident #type_generics as #incur::schemars::JsonSchema>::json_schema(generator)
+                }
             }
-        }
+        };
     })
 }
 

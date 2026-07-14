@@ -12,11 +12,20 @@ pub(crate) const INCUR_FULL_OUTPUT: &str = "__incur_full_output";
 pub(crate) const INCUR_FILTER_OUTPUT: &str = "__incur_filter_output";
 pub(crate) const INCUR_LLMS: &str = "__incur_llms";
 pub(crate) const INCUR_LLMS_FULL: &str = "__incur_llms_full";
+#[cfg(feature = "mcp")]
 pub(crate) const INCUR_MCP: &str = "__incur_mcp";
 pub(crate) const INCUR_SCHEMA: &str = "__incur_schema";
+#[cfg(feature = "tokens")]
 pub(crate) const INCUR_TOKEN_COUNT: &str = "__incur_token_count";
+#[cfg(feature = "tokens")]
 pub(crate) const INCUR_TOKEN_LIMIT: &str = "__incur_token_limit";
+#[cfg(feature = "tokens")]
 pub(crate) const INCUR_TOKEN_OFFSET: &str = "__incur_token_offset";
+
+#[cfg(feature = "yaml")]
+const OUTPUT_FORMATS: [&str; 5] = ["toon", "json", "yaml", "md", "jsonl"];
+#[cfg(not(feature = "yaml"))]
+const OUTPUT_FORMATS: [&str; 4] = ["toon", "json", "md", "jsonl"];
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GlobalOptions {
@@ -24,8 +33,11 @@ pub(crate) struct GlobalOptions {
     pub(crate) format: OutputFormat,
     pub(crate) format_explicit: bool,
     pub(crate) full_output: bool,
+    #[cfg(feature = "tokens")]
     pub(crate) token_count: bool,
+    #[cfg(feature = "tokens")]
     pub(crate) token_limit: Option<usize>,
+    #[cfg(feature = "tokens")]
     pub(crate) token_offset: usize,
 }
 
@@ -42,8 +54,11 @@ impl GlobalOptions {
             },
             format_explicit: json || format_value.is_some(),
             full_output: find_value::<bool>(matches, INCUR_FULL_OUTPUT).copied().unwrap_or(false),
+            #[cfg(feature = "tokens")]
             token_count: find_value::<bool>(matches, INCUR_TOKEN_COUNT).copied().unwrap_or(false),
+            #[cfg(feature = "tokens")]
             token_limit: find_value::<usize>(matches, INCUR_TOKEN_LIMIT).copied(),
+            #[cfg(feature = "tokens")]
             token_offset: find_value::<usize>(matches, INCUR_TOKEN_OFFSET).copied().unwrap_or(0),
         }
     }
@@ -76,7 +91,7 @@ pub(crate) fn augmented(mut command: Command, config_flag: Option<&str>) -> Resu
                 .long("format")
                 .global(true)
                 .value_name("FORMAT")
-                .value_parser(["toon", "json", "yaml", "md", "jsonl"])
+                .value_parser(OUTPUT_FORMATS)
                 .help("Output format"),
         )
         .arg(
@@ -108,41 +123,48 @@ pub(crate) fn augmented(mut command: Command, config_flag: Option<&str>) -> Resu
                 .help("Print the complete LLM-readable command manifest"),
         )
         .arg(
-            Arg::new(INCUR_MCP)
-                .long("mcp")
-                .action(ArgAction::SetTrue)
-                .help("Start an MCP server over stdio"),
-        )
-        .arg(
             Arg::new(INCUR_SCHEMA)
                 .long("schema")
                 .global(true)
                 .action(ArgAction::SetTrue)
                 .help("Show JSON Schema for the resolved command"),
-        )
-        .arg(
-            Arg::new(INCUR_TOKEN_COUNT)
-                .long("token-count")
-                .global(true)
-                .action(ArgAction::SetTrue)
-                .help("Print output token count instead of output"),
-        )
-        .arg(
-            Arg::new(INCUR_TOKEN_LIMIT)
-                .long("token-limit")
-                .global(true)
-                .value_name("N")
-                .value_parser(clap::value_parser!(usize))
-                .help("Limit output to N tokens"),
-        )
-        .arg(
-            Arg::new(INCUR_TOKEN_OFFSET)
-                .long("token-offset")
-                .global(true)
-                .value_name("N")
-                .value_parser(clap::value_parser!(usize))
-                .help("Skip the first N output tokens"),
         );
+    #[cfg(feature = "mcp")]
+    {
+        command = command.arg(
+            Arg::new(INCUR_MCP)
+                .long("mcp")
+                .action(ArgAction::SetTrue)
+                .help("Start an MCP server over stdio"),
+        );
+    }
+    #[cfg(feature = "tokens")]
+    {
+        command = command
+            .arg(
+                Arg::new(INCUR_TOKEN_COUNT)
+                    .long("token-count")
+                    .global(true)
+                    .action(ArgAction::SetTrue)
+                    .help("Print output token count instead of output"),
+            )
+            .arg(
+                Arg::new(INCUR_TOKEN_LIMIT)
+                    .long("token-limit")
+                    .global(true)
+                    .value_name("N")
+                    .value_parser(positive_usize)
+                    .help("Limit output to N tokens"),
+            )
+            .arg(
+                Arg::new(INCUR_TOKEN_OFFSET)
+                    .long("token-offset")
+                    .global(true)
+                    .value_name("N")
+                    .value_parser(clap::value_parser!(usize))
+                    .help("Skip the first N output tokens"),
+            );
+    }
     if let Some(flag) = config_flag {
         command = command
             .arg(
@@ -161,6 +183,7 @@ pub(crate) fn augmented(mut command: Command, config_flag: Option<&str>) -> Resu
             );
     }
 
+    #[cfg(feature = "completions")]
     if command.find_subcommand("completions").is_none() {
         command = command.subcommand(
             Command::new("completions").about("Generate a shell completion script").arg(
@@ -174,10 +197,13 @@ pub(crate) fn augmented(mut command: Command, config_flag: Option<&str>) -> Resu
             ),
         );
     }
+    #[cfg(feature = "skills")]
     if command.find_subcommand("skills").is_none() {
         command = command.subcommand(
             Command::new("skills")
                 .about("Sync skill files to coding agents")
+                .subcommand_required(true)
+                .arg_required_else_help(true)
                 .subcommand(
                     Command::new("add")
                         .about("Generate and install skill files")
@@ -197,37 +223,45 @@ pub(crate) fn augmented(mut command: Command, config_flag: Option<&str>) -> Resu
                 .subcommand(Command::new("list").about("List generated skills")),
         );
     }
+    #[cfg(feature = "mcp")]
     if command.find_subcommand("mcp").is_none() {
         command = command.subcommand(
-            Command::new("mcp").about("Register as an MCP server").subcommand(
-                Command::new("add")
-                    .about("Register this executable as an MCP server")
-                    .arg(Arg::new("command").short('c').long("command").value_name("COMMAND"))
-                    .arg(Arg::new("agent").long("agent").value_name("AGENT")),
-            ),
+            Command::new("mcp")
+                .about("Register as an MCP server")
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .subcommand(
+                    Command::new("add")
+                        .about("Register this executable as an MCP server")
+                        .arg(Arg::new("command").short('c').long("command").value_name("COMMAND"))
+                        .arg(Arg::new("agent").long("agent").value_name("AGENT")),
+                ),
         );
     }
     Ok(command)
 }
 
 fn check_conflicts(command: &Command, config_flag: Option<&str>) -> Result<()> {
-    const RESERVED: &[&str] = &[
-        "filter-output",
-        "format",
-        "full-output",
-        "json",
-        "llms",
-        "llms-full",
-        "mcp",
-        "schema",
-        "token-count",
-        "token-limit",
-        "token-offset",
-    ];
+    const RESERVED: &[&str] =
+        &["filter-output", "format", "full-output", "json", "llms", "llms-full", "schema"];
+    fn reserved(long: &str) -> bool {
+        if RESERVED.contains(&long) {
+            return true;
+        }
+        #[cfg(feature = "mcp")]
+        if matches!(long, "mcp") {
+            return true;
+        }
+        #[cfg(feature = "tokens")]
+        if matches!(long, "token-count" | "token-limit" | "token-offset") {
+            return true;
+        }
+        false
+    }
     fn visit(command: &Command, config_flag: Option<&str>) -> Option<String> {
         for argument in command.get_arguments() {
             if let Some(long) = argument.get_long()
-                && (RESERVED.contains(&long)
+                && (reserved(long)
                     || config_flag.is_some_and(|flag| long == flag || long == format!("no-{flag}")))
             {
                 return Some(long.to_owned());
@@ -242,6 +276,15 @@ fn check_conflicts(command: &Command, config_flag: Option<&str>) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(feature = "tokens")]
+fn positive_usize(value: &str) -> std::result::Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "expected a positive integer".to_owned())
 }
 
 pub(crate) fn command_path(matches: &clap::ArgMatches) -> Vec<String> {

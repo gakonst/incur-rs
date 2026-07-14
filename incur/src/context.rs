@@ -18,6 +18,7 @@ pub enum OutputFormat {
     /// Pretty-printed JSON.
     Json,
     /// YAML.
+    #[cfg(feature = "yaml")]
     Yaml,
     /// Markdown tables and sections.
     Markdown,
@@ -77,6 +78,7 @@ impl OutputFormat {
         match value {
             "toon" => Some(Self::Toon),
             "json" => Some(Self::Json),
+            #[cfg(feature = "yaml")]
             "yaml" => Some(Self::Yaml),
             "md" | "markdown" => Some(Self::Markdown),
             "jsonl" | "ndjson" => Some(Self::Jsonl),
@@ -197,7 +199,7 @@ impl Context {
 
     /// Attaches suggested next commands to a successful response.
     pub fn suggest(&self, cta: CtaBlock) {
-        *self.cta.lock().expect("CTA mutex poisoned") = Some(cta);
+        *self.cta.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cta);
     }
 
     /// Creates a structured command error.
@@ -211,15 +213,17 @@ impl Context {
 
     /// Sets a value shared with later middleware and the command handler.
     pub fn set_var(&self, name: impl Into<String>, value: impl Into<Value>) {
-        self.vars.write().expect("variable lock poisoned").insert(name.into(), value.into());
+        let name = name.into();
+        let value = value.into();
+        self.vars.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name, value);
     }
 
     /// Reads a value set by middleware.
     pub fn var(&self, name: &str) -> Option<Value> {
-        self.vars.read().expect("variable lock poisoned").get(name).cloned()
+        self.vars.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).cloned()
     }
 
     pub(crate) fn take_cta(&self) -> Option<CtaBlock> {
-        self.cta.lock().expect("CTA mutex poisoned").take()
+        self.cta.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
     }
 }

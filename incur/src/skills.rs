@@ -97,13 +97,17 @@ fn render(manifest: &Manifest, commands: &[crate::CommandInfo], skill_name: &str
     } else {
         manifest.description.clone().unwrap_or_else(|| format!("Use the {} CLI", manifest.name))
     };
+    let frontmatter_description = format!(
+        "{}. Run `{} --help` for usage details.",
+        description.trim_end_matches('.'),
+        manifest.name
+    );
     let mut output = format!(
-        "---\nname: {}\ndescription: {}. Run `{} --help` for usage details.\nrequires_bin: {}\ncommand: {}\n---\n",
+        "---\nname: {}\ndescription: {}\nrequires_bin: {}\ncommand: {}\n---\n",
         sanitize(skill_name),
-        yaml_scalar(description.trim_end_matches('.')),
-        manifest.name,
-        manifest.name,
-        manifest.name,
+        yaml_scalar(&frontmatter_description),
+        yaml_scalar(&manifest.name),
+        yaml_scalar(&manifest.name),
     );
     for command in commands {
         output.push_str(&format!("\n# {}\n", command.signature(&manifest.name)));
@@ -129,7 +133,8 @@ fn render(manifest: &Manifest, commands: &[crate::CommandInfo], skill_name: &str
 }
 
 fn yaml_scalar(value: &str) -> String {
-    serde_yaml::to_string(value).unwrap_or_else(|_| format!("{value:?}")).trim().to_owned()
+    // JSON strings are valid YAML scalars and avoid pulling the YAML formatter into `skills`.
+    serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
 }
 
 fn sanitize(name: &str) -> String {
@@ -193,8 +198,8 @@ fn link_detected_agents(canonical: &Path, name: &str, global: bool) {
         let agent_base = if global { global_path } else { cwd.join(project_path) };
         let link = agent_base.join(sanitize(name));
         let _ = fs::create_dir_all(&agent_base);
-        if link.symlink_metadata().is_ok() {
-            let _ = if link.is_dir() { fs::remove_dir_all(&link) } else { fs::remove_file(&link) };
+        if !link_available(&link) {
+            continue;
         }
         #[cfg(unix)]
         {
@@ -210,10 +215,21 @@ fn link_detected_agents(canonical: &Path, name: &str, global: bool) {
     }
 }
 
+fn link_available(link: &Path) -> bool {
+    match link.symlink_metadata() {
+        // Never delete a user's real directory, file, or symlink. A colliding path belongs to the
+        // user and wins, even when it is a stale link.
+        Ok(_) => false,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 fn write_metadata(manifest: &Manifest, paths: &[String]) -> Result<()> {
     let path = metadata_path(&manifest.name)
         .ok_or_else(|| Error::new("HOME_NOT_FOUND", "HOME is not set"))?;
-    let directory = path.parent().expect("metadata always has a parent");
+    let directory = path
+        .parent()
+        .ok_or_else(|| Error::new("INVALID_PATH", "skills metadata path has no parent"))?;
     fs::create_dir_all(directory)?;
     fs::write(
         path,
@@ -246,4 +262,37 @@ fn copy_dir(source: &Path, destination: &Path) -> std::io::Result<()> {
         fs::copy(entry.path(), destination.join(entry.file_name()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{generate, link_available};
+
+    #[test]
+    fn never_replaces_a_user_owned_skill_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("existing-skill");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("SKILL.md"), "user content").unwrap();
+
+        assert!(!link_available(&directory));
+        assert_eq!(std::fs::read_to_string(directory.join("SKILL.md")).unwrap(), "user content");
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn generated_skill_frontmatter_is_valid_yaml() {
+        let manifest = crate::Manifest {
+            name: "example-cli".to_owned(),
+            version: None,
+            description: Some("Manage values: safely".to_owned()),
+            commands: Vec::new(),
+        };
+        let (_, content) = generate(&manifest, 0).pop().unwrap();
+        let frontmatter = content.split("---").nth(1).unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(frontmatter).unwrap();
+
+        assert_eq!(value["requires_bin"], "example-cli");
+        assert!(value["description"].as_str().unwrap().contains("Manage values: safely"));
+    }
 }

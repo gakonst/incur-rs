@@ -13,6 +13,10 @@ struct Output {
     message: String,
 }
 
+// A derive helper must never leak into the consumer's namespace.
+#[allow(dead_code)]
+struct __IncurOutputForOutput;
+
 #[incur::main]
 async fn main() -> ExitCode {
     Cli::incur(run).serve().await

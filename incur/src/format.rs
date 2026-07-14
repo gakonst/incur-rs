@@ -11,6 +11,7 @@ pub(crate) fn render(value: &Value, format: OutputFormat) -> Result<String> {
 
     match format {
         OutputFormat::Json => Ok(serde_json::to_string_pretty(value)?),
+        #[cfg(feature = "yaml")]
         OutputFormat::Yaml => Ok(serde_yaml::to_string(value)?.trim_end().to_owned()),
         OutputFormat::Markdown => Ok(markdown(value)),
         OutputFormat::Jsonl => jsonl(value),
@@ -149,3 +150,46 @@ trait Pipe: Sized {
 }
 
 impl<T> Pipe for T {}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::render;
+    use crate::OutputFormat;
+
+    #[test]
+    fn renders_core_output_formats() {
+        let value = json!([{"name": "Ada", "active": true}, {"name": "Lin", "active": false}]);
+
+        let json = render(&value, OutputFormat::Json).unwrap();
+        assert!(json.contains("\"name\": \"Ada\""));
+        let jsonl = render(&value, OutputFormat::Jsonl).unwrap();
+        assert_eq!(jsonl.lines().count(), 2);
+        let markdown = render(&value, OutputFormat::Markdown).unwrap();
+        assert!(markdown.contains("| name | active |"));
+        assert!(markdown.contains("| Ada | true |"));
+    }
+
+    #[cfg(feature = "toon")]
+    #[test]
+    fn renders_toon() {
+        let output = render(&json!({"name": "Ada", "count": 2}), OutputFormat::Toon).unwrap();
+        assert!(output.contains("name"));
+        assert!(output.contains("Ada"));
+    }
+
+    #[cfg(not(feature = "toon"))]
+    #[test]
+    fn falls_back_to_json_without_toon() {
+        let output = render(&json!({"name": "Ada"}), OutputFormat::Toon).unwrap();
+        assert_eq!(output, r#"{"name":"Ada"}"#);
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn renders_yaml() {
+        let output = render(&json!({"name": "Ada"}), OutputFormat::Yaml).unwrap();
+        assert_eq!(output, "name: Ada");
+    }
+}

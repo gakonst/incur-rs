@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 
-use http::{Request, Response, StatusCode, header};
+use http::{Method, Request, Response, StatusCode, header};
 use serde_json::{Map, Value, json};
 
 use crate::{App, Error, InternalResult as Result, command};
@@ -29,6 +29,7 @@ where
             );
         }
         if matches!(request.uri().path(), "/openapi.yml" | "/openapi.yaml") {
+            #[cfg(feature = "yaml")]
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/yaml; charset=utf-8")
@@ -38,6 +39,11 @@ where
                         .into_bytes(),
                 )
                 .expect("a static HTTP response is valid");
+            #[cfg(not(feature = "yaml"))]
+            return json_response(
+                StatusCode::NOT_IMPLEMENTED,
+                br#"{"error":"the yaml feature is disabled"}"#.to_vec(),
+            );
         }
         if request.uri().path() == "/mcp" {
             return self.handle_mcp_http(request).await;
@@ -84,6 +90,13 @@ where
     }
 
     async fn handle_mcp_http(&self, _request: HttpRequest) -> HttpResponse {
+        if _request.method() != Method::POST {
+            return Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header(header::ALLOW, "POST")
+                .body(Vec::new())
+                .expect("a static HTTP response is valid");
+        }
         #[cfg(feature = "mcp")]
         {
             let message = match serde_json::from_slice::<Value>(_request.body()) {
@@ -100,11 +113,12 @@ where
                     );
                 }
             };
-            let response = crate::mcp::handle_jsonrpc(self, message).await.unwrap_or(Value::Null);
-            json_response(
-                if response.is_null() { StatusCode::ACCEPTED } else { StatusCode::OK },
-                serde_json::to_vec(&response).unwrap_or_default(),
-            )
+            match crate::mcp::handle_jsonrpc(self, message).await {
+                Some(response) => {
+                    json_response(StatusCode::OK, serde_json::to_vec(&response).unwrap_or_default())
+                }
+                None => json_response(StatusCode::ACCEPTED, Vec::new()),
+            }
         }
         #[cfg(not(feature = "mcp"))]
         json_response(

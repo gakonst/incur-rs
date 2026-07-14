@@ -220,6 +220,13 @@ where
 
         #[cfg(feature = "mcp")]
         if argv.iter().skip(1).any(|arg| arg == "--mcp") {
+            if let Err(error) = command::augmented(
+                self.command.clone(),
+                self.config.as_ref().map(|config| config.flag.as_str()),
+            ) {
+                let _ = writeln!(std::io::stderr(), "{error}");
+                return ExitCode::from(error.exit_code);
+            }
             return match crate::mcp::serve_stdio(self).await {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
@@ -300,12 +307,16 @@ where
         let handler = self.handler.clone();
         let input = Arc::new(Mutex::new(Some(input)));
         let leaf: BoxHandler = Arc::new(move |context| {
-            let input = input
-                .lock()
-                .expect("command input mutex poisoned")
-                .take()
-                .expect("middleware called Next more than once");
-            handler(input, context)
+            let input = input.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+            match input {
+                Some(input) => handler(input, context),
+                None => Box::pin(async {
+                    Err(Error::new(
+                        "MIDDLEWARE_REENTRY",
+                        "middleware may continue an invocation only once",
+                    ))
+                }),
+            }
         });
         let mut middlewares = self.middlewares.clone();
         if let Some(command_middlewares) = self.command_middlewares.get(&path) {
@@ -321,6 +332,13 @@ where
                 if let Some(filter) = &globals.filter_output {
                     data = filter::apply(&data, filter);
                 }
+                #[cfg(feature = "tokens")]
+                if globals.token_count {
+                    return match format::render(&data, globals.format) {
+                        Ok(rendered) => Execution::success(tokenize(&rendered).len().to_string()),
+                        Err(error) => self.render_error(error, globals.format, agent, &path),
+                    };
+                }
                 let cta = cta_context.take_cta();
                 #[cfg(feature = "skills")]
                 let cta = cta.or_else(|| crate::skills::stale_cta(&self.manifest));
@@ -328,28 +346,54 @@ where
                     ("command".to_owned(), Value::String(path.clone())),
                     ("duration".to_owned(), Value::String(duration)),
                 ]);
-                let mut value = if globals.full_output || agent {
-                    let mut envelope = Map::from_iter([
-                        ("ok".to_owned(), Value::Bool(true)),
-                        ("data".to_owned(), data),
-                        ("meta".to_owned(), Value::Object(meta.clone())),
-                    ]);
-                    if let Some(cta) = &cta {
-                        envelope.insert(
-                            "cta".to_owned(),
-                            serde_json::to_value(cta).unwrap_or_default(),
-                        );
-                    }
-                    Value::Object(envelope)
-                } else {
-                    data
-                };
+                if let Some(cta) = &cta
+                    && let Ok(cta) = serde_json::to_value(cta)
+                {
+                    meta.insert("cta".to_owned(), cta);
+                }
+                let full_output = globals.full_output || agent;
                 let policy =
                     self.command_output_policies.get(&path).copied().unwrap_or(self.output_policy);
                 let suppress_data = !agent
                     && policy == OutputPolicy::AgentOnly
                     && !globals.format_explicit
                     && !globals.full_output;
+
+                #[cfg(feature = "tokens")]
+                if !suppress_data && (globals.token_offset > 0 || globals.token_limit.is_some()) {
+                    let rendered = match format::render(&data, globals.format) {
+                        Ok(rendered) => rendered,
+                        Err(error) => {
+                            return self.render_error(error, globals.format, agent, &path);
+                        }
+                    };
+                    let page =
+                        paginate_tokens(&rendered, globals.token_offset, globals.token_limit);
+                    if page.truncated {
+                        if full_output {
+                            if let Some(next_offset) = page.next_offset {
+                                meta.insert("nextOffset".to_owned(), json!(next_offset));
+                            }
+                            data = Value::String(page.text);
+                        } else {
+                            let mut rendered = page.text;
+                            if let Some(cta) = cta {
+                                rendered.push_str(&render_cta(&self.manifest.name, &cta));
+                            }
+                            return Execution::success(rendered);
+                        }
+                    }
+                }
+
+                let value = if full_output {
+                    Value::Object(Map::from_iter([
+                        ("ok".to_owned(), Value::Bool(true)),
+                        ("data".to_owned(), data),
+                        ("meta".to_owned(), Value::Object(meta)),
+                    ]))
+                } else {
+                    data
+                };
                 let mut rendered = if suppress_data {
                     String::new()
                 } else {
@@ -360,26 +404,6 @@ where
                         }
                     }
                 };
-                if globals.token_count {
-                    return Execution::success(tokenize(&rendered).len().to_string());
-                }
-                if globals.token_offset > 0 || globals.token_limit.is_some() {
-                    let tokens = tokenize(&rendered);
-                    let start = globals.token_offset.min(tokens.len());
-                    let end = globals
-                        .token_limit
-                        .map(|limit| start.saturating_add(limit).min(tokens.len()))
-                        .unwrap_or(tokens.len());
-                    if end < tokens.len() && (globals.full_output || agent) {
-                        meta.insert("nextOffset".to_owned(), json!(end));
-                        meta.insert("totalTokens".to_owned(), json!(tokens.len()));
-                        if let Value::Object(envelope) = &mut value {
-                            envelope.insert("meta".to_owned(), Value::Object(meta));
-                        }
-                        rendered = format::render(&value, globals.format).unwrap_or(rendered);
-                    }
-                    rendered = slice_tokens(&rendered, start, end);
-                }
                 if !agent && let Some(cta) = cta {
                     rendered.push_str(&render_cta(&self.manifest.name, &cta));
                 }
@@ -421,7 +445,10 @@ where
         if args.contains(&"--llms-full") {
             let path = resolve_raw_path(&self.command, &args);
             let manifest = self.manifest.scoped(&path);
-            let format = raw_format(&args);
+            let format = match raw_format(&args) {
+                Ok(format) => format,
+                Err(error) => return Some(execution_error(error)),
+            };
             return Some(if raw_format_explicit(&args) && format != OutputFormat::Markdown {
                 match format::render(&self.manifest.filtered(&path).full_value(), format) {
                     Ok(output) => Execution::success(output),
@@ -434,7 +461,10 @@ where
         if args.contains(&"--llms") {
             let path = resolve_raw_path(&self.command, &args);
             let manifest = self.manifest.scoped(&path);
-            let format = raw_format(&args);
+            let format = match raw_format(&args) {
+                Ok(format) => format,
+                Err(error) => return Some(execution_error(error)),
+            };
             return Some(if raw_format_explicit(&args) && format != OutputFormat::Markdown {
                 match format::render(&self.manifest.filtered(&path).index_value(), format) {
                     Ok(output) => Execution::success(output),
@@ -453,35 +483,70 @@ where
                     json!({"input": command.input_schema, "output": command.output_schema})
                 })
                 .unwrap_or_else(|| json!({"commands": self.manifest.commands}));
-            let format = raw_format(&args);
+            let format = match raw_format(&args) {
+                Ok(format) => format,
+                Err(error) => return Some(execution_error(error)),
+            };
             return Some(match format::render(&schema, format) {
                 Ok(output) => Execution::success(output),
                 Err(error) => Execution::failure(error.to_string(), error.exit_code),
             });
         }
-        if args.first() == Some(&"completions") {
-            return Some(self.completions(args.get(1).copied()));
+        #[cfg(feature = "completions")]
+        if self.command.find_subcommand("completions").is_none()
+            && args.first() == Some(&"completions")
+        {
+            let matches = match self.builtin_matches(argv) {
+                Ok(matches) => matches,
+                Err(execution) => return Some(execution),
+            };
+            let shell = matches
+                .subcommand_matches("completions")
+                .and_then(|matches| matches.get_one::<String>("shell"))
+                .map(String::as_str);
+            return Some(self.completions(shell));
         }
         #[cfg(feature = "skills")]
-        if args.get(0..2) == Some(&["skills", "add"]) {
-            let global = !args.contains(&"--project");
-            let depth =
-                flag_value(&args, "--depth").and_then(|value| value.parse().ok()).unwrap_or(1);
-            return Some(match crate::skills::install(&self.manifest, global, depth) {
-                Ok(paths) => Execution::success(json!({"skills": paths}).to_string()),
-                Err(error) => Execution::failure(error.to_string(), error.exit_code),
+        if self.command.find_subcommand("skills").is_none() && args.first() == Some(&"skills") {
+            let matches = match self.builtin_matches(argv) {
+                Ok(matches) => matches,
+                Err(execution) => return Some(execution),
+            };
+            let Some(skills) = matches.subcommand_matches("skills") else {
+                return Some(Execution::failure("expected skills add or skills list", 2));
+            };
+            return Some(match skills.subcommand() {
+                Some(("add", add)) => {
+                    let global = !add.get_flag("project");
+                    let depth = add.get_one::<usize>("depth").copied().unwrap_or(1);
+                    match crate::skills::install(&self.manifest, global, depth) {
+                        Ok(paths) => Execution::success(json!({"skills": paths}).to_string()),
+                        Err(error) => Execution::failure(error.to_string(), error.exit_code),
+                    }
+                }
+                Some(("list", _)) => {
+                    Execution::success(crate::skills::list(&self.manifest, 1).to_string())
+                }
+                _ => Execution::failure("expected skills add or skills list", 2),
             });
         }
-        #[cfg(feature = "skills")]
-        if args.get(0..2) == Some(&["skills", "list"]) {
-            return Some(Execution::success(crate::skills::list(&self.manifest, 1).to_string()));
-        }
         #[cfg(feature = "mcp")]
-        if args.get(0..2) == Some(&["mcp", "add"]) {
-            let command = flag_value(&args, "--command")
-                .map(str::to_owned)
+        if self.command.find_subcommand("mcp").is_none() && args.first() == Some(&"mcp") {
+            let matches = match self.builtin_matches(argv) {
+                Ok(matches) => matches,
+                Err(execution) => return Some(execution),
+            };
+            let Some(add) = matches
+                .subcommand_matches("mcp")
+                .and_then(|matches| matches.subcommand_matches("add"))
+            else {
+                return Some(Execution::failure("expected mcp add", 2));
+            };
+            let command = add
+                .get_one::<String>("command")
+                .cloned()
                 .unwrap_or_else(|| format!("{} --mcp", self.manifest.name));
-            let agent = flag_value(&args, "--agent");
+            let agent = add.get_one::<String>("agent").map(String::as_str);
             return Some(match crate::mcp::register(&self.manifest.name, &command, agent) {
                 Ok(paths) => {
                     Execution::success(json!({"command": command, "paths": paths}).to_string())
@@ -492,6 +557,20 @@ where
         None
     }
 
+    #[cfg(any(feature = "completions", feature = "skills", feature = "mcp"))]
+    fn builtin_matches(
+        &self,
+        argv: &[OsString],
+    ) -> std::result::Result<clap::ArgMatches, Execution> {
+        command::augmented(
+            self.command.clone(),
+            self.config.as_ref().map(|config| config.flag.as_str()),
+        )
+        .and_then(|command| command.try_get_matches_from(argv).map_err(clap_error))
+        .map_err(execution_error)
+    }
+
+    #[cfg(feature = "completions")]
     fn completions(&self, shell: Option<&str>) -> Execution {
         use clap_complete::{Shell, generate};
         let shell = match shell.and_then(|shell| shell.parse::<Shell>().ok()) {
@@ -517,7 +596,7 @@ where
         let command = self
             .manifest
             .tool(name)
-            .ok_or_else(|| Error::new("METHOD_NOT_FOUND", format!("unknown tool `{name}`")))?;
+            .ok_or_else(|| Error::new("INVALID_PARAMS", format!("unknown tool `{name}`")))?;
         let mut argv = command::argv_for_tool(&self.manifest.name, command, &input)?;
         argv.extend([OsString::from("--format"), OsString::from("json")]);
         let execution = self.execute_inner(argv, true).await;
@@ -638,16 +717,40 @@ fn format_duration(duration: std::time::Duration) -> String {
     }
 }
 
+#[cfg(feature = "tokens")]
 fn tokenize(value: &str) -> Vec<u32> {
     tiktoken_rs::cl100k_base_singleton().encode_ordinary(value)
 }
 
+#[cfg(feature = "tokens")]
 fn slice_tokens(value: &str, start: usize, end: usize) -> String {
     let tokenizer = tiktoken_rs::cl100k_base_singleton();
     let tokens = tokenizer.encode_ordinary(value);
     tokenizer
         .decode(tokens[start.min(tokens.len())..end.min(tokens.len())].to_vec())
         .unwrap_or_default()
+}
+
+#[cfg(feature = "tokens")]
+struct TokenPage {
+    text: String,
+    truncated: bool,
+    next_offset: Option<usize>,
+}
+
+#[cfg(feature = "tokens")]
+fn paginate_tokens(value: &str, offset: usize, limit: Option<usize>) -> TokenPage {
+    let total = tokenize(value).len();
+    let start = offset.min(total);
+    let end = limit.map(|limit| start.saturating_add(limit).min(total)).unwrap_or(total);
+    if start == 0 && end == total {
+        return TokenPage { text: value.to_owned(), truncated: false, next_offset: None };
+    }
+    let text = format!(
+        "{}\n[truncated: showing tokens {start}–{end} of {total}]",
+        slice_tokens(value, start, end)
+    );
+    TokenPage { text, truncated: true, next_offset: (end < total).then_some(end) }
 }
 
 fn render_cta(name: &str, cta: &crate::CtaBlock) -> String {
@@ -695,11 +798,19 @@ fn resolve_raw_path(command: &clap::Command, args: &[&str]) -> String {
     path.join(" ")
 }
 
-fn raw_format(args: &[&str]) -> OutputFormat {
+fn raw_format(args: &[&str]) -> Result<OutputFormat> {
     if args.contains(&"--json") {
-        return OutputFormat::Json;
+        return Ok(OutputFormat::Json);
     }
-    flag_value(args, "--format").and_then(OutputFormat::parse).unwrap_or_default()
+    let Some(value) = flag_value(args, "--format") else {
+        if raw_format_explicit(args) {
+            return Err(Error::new("ARGUMENT_ERROR", "--format requires a value").exit_code(2));
+        }
+        return Ok(OutputFormat::default());
+    };
+    OutputFormat::parse(value).ok_or_else(|| {
+        Error::new("ARGUMENT_ERROR", format!("unsupported output format `{value}`")).exit_code(2)
+    })
 }
 
 fn raw_format_explicit(args: &[&str]) -> bool {
